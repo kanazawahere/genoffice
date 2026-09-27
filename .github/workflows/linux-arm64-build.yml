@@ -1,0 +1,112 @@
+name: Linux arm64 build (fork-only, unofficial)
+
+# Repo gốc genspark-ai/genoffice chỉ phát hành Linux x86_64 (.deb/.rpm/AppImage).
+# Workflow này build BẢN KHÔNG CHÍNH THỨC cho Linux arm64 trên chính runner
+# arm64 của GitHub — sidecar Rust (xlsx-engine) build native theo kiến trúc
+# runner, và electron-builder được ép target arm64 (xem bước "patch linux
+# target arch"). Kích hoạt tay (workflow_dispatch), không tự chạy theo push.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag/branch/sha) để build, mặc định = tag mới nhất của upstream"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Resolve ref
+        id: resolve
+        run: |
+          if [ -n "${{ github.event.inputs.ref }}" ]; then
+            echo "ref=${{ github.event.inputs.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            git ls-remote --tags --refs https://github.com/genspark-ai/genoffice.git \
+              | awk -F/ '{print $NF}' | sort -V | tail -1 > /tmp/tag.txt
+            echo "ref=$(cat /tmp/tag.txt)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust (stable, host-native aarch64)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache node_modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+            */*/node_modules
+          key: npm-arm64-${{ hashFiles('package-lock.json') }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            apps/sheets/native/xlsx-engine/target
+          key: cargo-arm64-${{ hashFiles('apps/sheets/native/xlsx-engine/Cargo.lock') }}
+
+      - name: npm ci
+        run: npm ci
+
+      - name: Build all modules (bao gồm cargo build --release cho sidecar, host-native = arm64)
+        run: npm run build:all
+
+      - name: Generate third-party notices
+        run: npm run notices
+
+      - name: Patch electron-builder linux target arch x64 -> arm64
+        run: |
+          sed -i "s/{ target: 'AppImage', arch: \['x64'\] }/{ target: 'AppImage', arch: ['arm64'] }/" apps/shell/electron-builder.cjs
+          sed -i "s/{ target: 'deb', arch: \['x64'\] }/{ target: 'deb', arch: ['arm64'] }/" apps/shell/electron-builder.cjs
+          sed -i "s/{ target: 'rpm', arch: \['x64'\] }/{ target: 'rpm', arch: ['arm64'] }/" apps/shell/electron-builder.cjs
+          grep -n "target: 'AppImage'\|target: 'deb'\|target: 'rpm'" apps/shell/electron-builder.cjs
+
+      - name: Package Linux arm64 (AppImage + deb + rpm)
+        working-directory: apps/shell
+        run: |
+          npm run notices
+          npx electron-builder --linux --arm64
+
+      - name: List artifacts
+        run: ls -la apps/shell/release/
+
+      - name: Upload build artifacts (workflow run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: genoffice-linux-arm64-${{ steps.resolve.outputs.ref }}
+          path: |
+            apps/shell/release/*.AppImage
+            apps/shell/release/*.deb
+            apps/shell/release/*.rpm
+
+      - name: Publish to GitHub Release (fork)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="linux-arm64-${{ steps.resolve.outputs.ref }}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "GenOffice Linux arm64 (unofficial, built from ${{ steps.resolve.outputs.ref }})" \
+            --notes "Build không chính thức cho Linux arm64, dựng từ mã nguồn genspark-ai/genoffice@${{ steps.resolve.outputs.ref }} qua fork này. Repo gốc chưa phát hành bản Linux arm64 (chỉ x86_64)." \
+            --latest=false \
+            apps/shell/release/*.AppImage \
+            apps/shell/release/*.deb \
+            apps/shell/release/*.rpm \
+            || echo "release đã tồn tại hoặc lỗi upload — xem log"
